@@ -63,13 +63,37 @@ fi
 
 # Locate the venv + entrypoint the installer produced
 CRAFTY_HOME="${INSTALL_DIR}/crafty/crafty-4"
-if [[ ! -f "${CRAFTY_HOME}/main.py" ]]; then
-  echo "Crafty install did not land where expected (${CRAFTY_HOME})." >&2
-  echo "Check /root/crafty-installer-4.0 output and re-run." >&2
+# Crafty's installer creates the virtualenv as ".venv" one level up from
+# crafty-4 (i.e. ${INSTALL_DIR}/crafty/.venv), not inside crafty-4.
+CRAFTY_VENV="${INSTALL_DIR}/crafty/.venv"
+if [[ ! -f "${CRAFTY_HOME}/main.py" || ! -x "${CRAFTY_VENV}/bin/python3" ]]; then
+  echo "Crafty install did not land where expected." >&2
+  echo "  expected entrypoint: ${CRAFTY_HOME}/main.py" >&2
+  echo "  expected venv:       ${CRAFTY_VENV}/bin/python3" >&2
+  echo "Check /root/crafty-installer-4.0/installer.log and re-run." >&2
   exit 1
 fi
 
-echo "==> Creating systemd service..."
+# The installer's own pip step sometimes doesn't complete; install the Python
+# dependencies into the venv explicitly so the panel can actually start.
+echo "==> Installing Crafty Python dependencies into the venv..."
+"${CRAFTY_VENV}/bin/pip" install -q -r "${CRAFTY_HOME}/requirements.txt"
+
+# Verify the deps actually landed (peewee is the first import in main.py).
+if ! "${CRAFTY_VENV}/bin/python3" -c "import peewee" 2>/dev/null; then
+  echo "Crafty dependencies failed to install (peewee not importable)." >&2
+  echo "Re-run: ${CRAFTY_VENV}/bin/pip install -r ${CRAFTY_HOME}/requirements.txt" >&2
+  exit 1
+fi
+
+# Crafty REFUSES to run as root - it must run as an unprivileged user. The
+# installer creates a 'crafty' user that owns the install dir; use it.
+CRAFTY_USER="$(stat -c '%U' "${CRAFTY_HOME}")"
+[[ "${CRAFTY_USER}" == "root" || -z "${CRAFTY_USER}" ]] && CRAFTY_USER="crafty"
+id "${CRAFTY_USER}" &>/dev/null || useradd -r -d "${INSTALL_DIR}/crafty" -s /usr/sbin/nologin "${CRAFTY_USER}"
+chown -R "${CRAFTY_USER}:${CRAFTY_USER}" "${INSTALL_DIR}"
+
+echo "==> Creating systemd service (running as '${CRAFTY_USER}')..."
 cat > /etc/systemd/system/crafty.service <<EOF
 [Unit]
 Description=Crafty Controller (Minecraft panel)
@@ -78,8 +102,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=${CRAFTY_USER}
+Group=${CRAFTY_USER}
 WorkingDirectory=${CRAFTY_HOME}
-ExecStart=${CRAFTY_HOME}/venv/bin/python3 main.py
+ExecStart=${CRAFTY_VENV}/bin/python3 main.py
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65535
@@ -94,7 +120,6 @@ EOF
 # Crafty reads these config files on first boot. default.json is a one-shot
 # file that Crafty ingests and deletes to set the initial admin account.
 CONF_DIR="${CRAFTY_HOME}/app/config"
-CRAFTY_USER="$(stat -c '%U' "${CRAFTY_HOME}")"   # the unprivileged crafty user
 
 if [[ "${CRAFTY_PORT}" != "8443" ]]; then
   echo "==> Setting Crafty web port to ${CRAFTY_PORT}..."
@@ -124,6 +149,9 @@ EOF
 else
   ADMIN_NOTE="username 'admin' with a RANDOM password (retrieve it - see below)"
 fi
+
+# Final ownership pass - the config edits above may have written files as root.
+chown -R "${CRAFTY_USER}:${CRAFTY_USER}" "${INSTALL_DIR}"
 
 systemctl daemon-reload
 systemctl enable crafty.service >/dev/null
